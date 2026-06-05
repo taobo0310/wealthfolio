@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
+use wealthfolio_core::constants::DECIMAL_PRECISION;
 use wealthfolio_core::errors::{DatabaseError, Error, Result};
+use wealthfolio_core::portfolio::snapshot::Position;
 use wealthfolio_core::sync::{
     should_apply_lww, SyncEngineStatus, SyncEntity, SyncEntityMetadata, SyncOperation,
     SyncOutboxEvent, SyncOutboxStatus, APP_SYNC_TABLES,
@@ -152,6 +154,7 @@ const ROWS_WITH_USER_SYNCABLE_ACTIVITY_FILTER_SQL: &str = "\
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncRowFilter {
     UserSyncableHoldingsSnapshots,
+    UserSyncableSnapshotPositions,
     ManualQuotes,
     UserImportRuns,
     UserSyncableActivities,
@@ -162,6 +165,9 @@ enum SyncRowFilter {
     SyncableTaxonomyCategories,
     UserModifiedBudgetGroups,
     UserModifiedBudgetGroupAssignments,
+    BudgetGroupAssignmentsWithExistingDependencies,
+    BudgetTargetsWithExistingDependencies,
+    BudgetRolloverSettingsWithExistingDependencies,
     UserModifiedSpendingEventTypes,
     OverwriteRiskAccounts,
     OverwriteRiskPlatforms,
@@ -174,7 +180,14 @@ impl SyncRowFilter {
     fn sql(self) -> &'static str {
         match self {
             Self::UserSyncableHoldingsSnapshots => {
-                "account_id IN (SELECT id FROM accounts) AND source IN ('MANUAL_ENTRY', 'CSV_IMPORT', 'SYNTHETIC', 'BROKER_IMPORTED')"
+                "account_id IN (SELECT id FROM accounts) AND source IN ('MANUAL_ENTRY', 'CSV_IMPORT', 'SYNTHETIC')"
+            }
+            Self::UserSyncableSnapshotPositions => {
+                "snapshot_id IN (
+                    SELECT id FROM holdings_snapshots
+                    WHERE account_id IN (SELECT id FROM accounts)
+                      AND source IN ('MANUAL_ENTRY', 'CSV_IMPORT', 'SYNTHETIC')
+                )"
             }
             Self::ManualQuotes => "source = 'MANUAL'",
             Self::UserImportRuns => {
@@ -190,10 +203,44 @@ impl SyncRowFilter {
             Self::UserTaxonomies => "is_system = 0",
             // Spending/income seed category IDs use the `cat_` prefix; user-created rows use UUIDs.
             Self::SyncableTaxonomyCategories => {
-                "taxonomy_id = 'custom_groups' OR (taxonomy_id IN ('spending_categories', 'income_sources', 'savings_categories') AND id NOT LIKE 'cat_%')"
+                "taxonomy_id = 'custom_groups' \
+                 OR taxonomy_id IN (SELECT id FROM taxonomies WHERE is_system = 0) \
+                 OR (taxonomy_id IN ('spending_categories', 'income_sources', 'savings_categories') AND id NOT LIKE 'cat_%')"
             }
             Self::UserModifiedBudgetGroups | Self::UserModifiedBudgetGroupAssignments => {
                 "is_system = 0 OR updated_at != created_at"
+            }
+            Self::BudgetGroupAssignmentsWithExistingDependencies => {
+                "group_id IN (SELECT id FROM budget_groups) \
+                 AND EXISTS (
+                     SELECT 1 FROM taxonomy_categories AS tc
+                     WHERE tc.taxonomy_id = budget_group_assignments.taxonomy_id
+                       AND tc.id = budget_group_assignments.category_id
+                 )"
+            }
+            Self::BudgetTargetsWithExistingDependencies => {
+                "(target_type = 'category' \
+                    AND taxonomy_id IS NOT NULL \
+                    AND category_id IS NOT NULL \
+                    AND EXISTS (
+                        SELECT 1 FROM taxonomy_categories AS tc
+                        WHERE tc.taxonomy_id = budget_targets.taxonomy_id
+                          AND tc.id = budget_targets.category_id
+                    )) \
+                 OR (target_type = 'group_buffer' \
+                    AND group_id IN (SELECT id FROM budget_groups))"
+            }
+            Self::BudgetRolloverSettingsWithExistingDependencies => {
+                "(target_type = 'category' \
+                    AND taxonomy_id IS NOT NULL \
+                    AND category_id IS NOT NULL \
+                    AND EXISTS (
+                        SELECT 1 FROM taxonomy_categories AS tc
+                        WHERE tc.taxonomy_id = budget_rollover_settings.taxonomy_id
+                          AND tc.id = budget_rollover_settings.category_id
+                    )) \
+                 OR (target_type = 'group' \
+                    AND group_id IN (SELECT id FROM budget_groups))"
             }
             Self::UserModifiedSpendingEventTypes => "key IS NULL OR updated_at != created_at",
             Self::OverwriteRiskAccounts => {
@@ -622,6 +669,10 @@ const SYNC_TABLE_SNAPSHOT_COPY_FILTERS: &[SyncTableFilterSpec] = &[
         filter: SyncRowFilter::UserSyncableHoldingsSnapshots,
     },
     SyncTableFilterSpec {
+        table: "snapshot_positions",
+        filter: SyncRowFilter::UserSyncableSnapshotPositions,
+    },
+    SyncTableFilterSpec {
         table: "quotes",
         filter: SyncRowFilter::ManualQuotes,
     },
@@ -660,6 +711,18 @@ const SYNC_TABLE_SNAPSHOT_COPY_FILTERS: &[SyncTableFilterSpec] = &[
         table: "app_settings",
         filter: SyncRowFilter::SpendingSettings,
     },
+    SyncTableFilterSpec {
+        table: "budget_group_assignments",
+        filter: SyncRowFilter::BudgetGroupAssignmentsWithExistingDependencies,
+    },
+    SyncTableFilterSpec {
+        table: "budget_targets",
+        filter: SyncRowFilter::BudgetTargetsWithExistingDependencies,
+    },
+    SyncTableFilterSpec {
+        table: "budget_rollover_settings",
+        filter: SyncRowFilter::BudgetRolloverSettingsWithExistingDependencies,
+    },
     // Drop legacy orphan membership rows at snapshot boundaries. Portfolio
     // settings remains the user-facing repair surface for the source DB.
     SyncTableFilterSpec {
@@ -672,6 +735,10 @@ const SYNC_TABLE_SNAPSHOT_CLEAR_FILTERS: &[SyncTableFilterSpec] = &[
     SyncTableFilterSpec {
         table: "holdings_snapshots",
         filter: SyncRowFilter::UserSyncableHoldingsSnapshots,
+    },
+    SyncTableFilterSpec {
+        table: "snapshot_positions",
+        filter: SyncRowFilter::UserSyncableSnapshotPositions,
     },
     SyncTableFilterSpec {
         table: "quotes",
@@ -704,6 +771,18 @@ const SYNC_TABLE_SNAPSHOT_CLEAR_FILTERS: &[SyncTableFilterSpec] = &[
     SyncTableFilterSpec {
         table: "app_settings",
         filter: SyncRowFilter::SpendingSettings,
+    },
+    SyncTableFilterSpec {
+        table: "budget_group_assignments",
+        filter: SyncRowFilter::BudgetGroupAssignmentsWithExistingDependencies,
+    },
+    SyncTableFilterSpec {
+        table: "budget_targets",
+        filter: SyncRowFilter::BudgetTargetsWithExistingDependencies,
+    },
+    SyncTableFilterSpec {
+        table: "budget_rollover_settings",
+        filter: SyncRowFilter::BudgetRolloverSettingsWithExistingDependencies,
     },
 ];
 
@@ -738,6 +817,158 @@ fn delete_orphan_snapshot_rows(conn: &mut SqliteConnection) -> Result<()> {
     )
     .execute(conn)
     .map_err(StorageError::from)?;
+
+    Ok(())
+}
+
+fn reset_restore_dependent_read_models(
+    conn: &mut SqliteConnection,
+    table_set: &HashSet<String>,
+) -> Result<()> {
+    if table_set.contains("snapshot_positions")
+        || table_set.contains("holdings_snapshots")
+        || table_set.contains("assets")
+    {
+        diesel::sql_query("DELETE FROM snapshot_positions")
+            .execute(conn)
+            .map_err(StorageError::from)?;
+    }
+
+    if table_set.contains("accounts")
+        || table_set.contains("assets")
+        || table_set.contains("activities")
+    {
+        for table in ["lot_disposals", "lots", "daily_account_valuation"] {
+            diesel::sql_query(format!("DELETE FROM {}", quote_identifier(table)))
+                .execute(conn)
+                .map_err(StorageError::from)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn deserialize_snapshot_positions_payload(
+    positions_json: &str,
+    account_id: &str,
+) -> HashMap<String, Position> {
+    if positions_json.is_empty() || positions_json == "{}" {
+        return HashMap::new();
+    }
+
+    match serde_json::from_str::<HashMap<String, Position>>(positions_json) {
+        Ok(mut positions) => {
+            for position in positions.values_mut() {
+                if position.account_id.is_empty() {
+                    position.account_id = account_id.to_string();
+                }
+            }
+            positions
+        }
+        Err(err) => {
+            log::warn!(
+                "Leaving snapshot_positions empty because synced positions JSON could not be decoded (account {}): {}",
+                account_id,
+                err
+            );
+            HashMap::new()
+        }
+    }
+}
+
+fn rebuild_snapshot_positions_from_snapshot_row_tx(
+    conn: &mut SqliteConnection,
+    snapshot_id_value: &str,
+) -> Result<()> {
+    use crate::schema::assets::dsl as asset_dsl;
+    use crate::schema::holdings_snapshots::dsl as snapshot_dsl;
+    use crate::schema::snapshot_positions::dsl as position_dsl;
+
+    let snapshot_row = snapshot_dsl::holdings_snapshots
+        .select((snapshot_dsl::account_id, snapshot_dsl::positions))
+        .filter(snapshot_dsl::id.eq(snapshot_id_value))
+        .first::<(String, String)>(conn)
+        .optional()
+        .map_err(StorageError::from)?;
+
+    diesel::delete(
+        position_dsl::snapshot_positions.filter(position_dsl::snapshot_id.eq(snapshot_id_value)),
+    )
+    .execute(conn)
+    .map_err(StorageError::from)?;
+
+    let Some((account_id, positions_json)) = snapshot_row else {
+        return Ok(());
+    };
+
+    let positions = deserialize_snapshot_positions_payload(&positions_json, &account_id);
+    if positions.is_empty() {
+        return Ok(());
+    }
+
+    let requested_asset_ids = positions
+        .values()
+        .map(|position| position.asset_id.clone())
+        .collect::<HashSet<_>>();
+    let requested_asset_ids_vec = requested_asset_ids.iter().cloned().collect::<Vec<_>>();
+    let existing_asset_ids = asset_dsl::assets
+        .select(asset_dsl::id)
+        .filter(asset_dsl::id.eq_any(&requested_asset_ids_vec))
+        .load::<String>(conn)
+        .map_err(StorageError::from)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    if existing_asset_ids.len() != requested_asset_ids.len() {
+        let missing = requested_asset_ids
+            .difference(&existing_asset_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        log::warn!(
+            "Leaving snapshot_positions empty for snapshot {} because synced positions reference missing assets: {:?}",
+            snapshot_id_value,
+            missing
+        );
+        return Ok(());
+    }
+
+    for position in positions.values() {
+        let insert_sql = format!(
+            "INSERT INTO snapshot_positions (
+                snapshot_id, asset_id, quantity, average_cost, total_cost_basis,
+                currency, inception_date, is_alternative, contract_multiplier,
+                created_at, last_updated
+            ) VALUES (
+                '{}', '{}', '{}', '{}', '{}',
+                '{}', '{}', {}, '{}',
+                '{}', '{}'
+            )",
+            escape_sqlite_str(snapshot_id_value),
+            escape_sqlite_str(&position.asset_id),
+            escape_sqlite_str(&position.quantity.round_dp(DECIMAL_PRECISION).to_string()),
+            escape_sqlite_str(
+                &position
+                    .average_cost
+                    .round_dp(DECIMAL_PRECISION)
+                    .to_string()
+            ),
+            escape_sqlite_str(
+                &position
+                    .total_cost_basis
+                    .round_dp(DECIMAL_PRECISION)
+                    .to_string()
+            ),
+            escape_sqlite_str(&position.currency),
+            escape_sqlite_str(&position.inception_date.to_rfc3339()),
+            if position.is_alternative { 1 } else { 0 },
+            escape_sqlite_str(&position.contract_multiplier.to_string()),
+            escape_sqlite_str(&position.created_at.to_rfc3339()),
+            escape_sqlite_str(&position.last_updated.to_rfc3339())
+        );
+        diesel::sql_query(insert_sql)
+            .execute(conn)
+            .map_err(StorageError::from)?;
+    }
 
     Ok(())
 }
@@ -955,14 +1186,11 @@ fn json_value_to_sql_literal(value: &serde_json::Value) -> String {
     }
 }
 
-fn snapshot_restore_error(table: &str, err: StorageError) -> Error {
-    let error: Error = err.into();
-    let message = format!("Snapshot restore failed for table={table}: {error}");
-    if is_foreign_key_error_message(&message) {
-        Error::Database(DatabaseError::ForeignKeyViolation(message))
-    } else {
-        Error::Database(DatabaseError::Internal(message))
-    }
+fn restore_sql_error(phase: &str, table: &str, err: diesel::result::Error) -> Error {
+    let core_error: Error = StorageError::from(err).into();
+    Error::Database(DatabaseError::Internal(format!(
+        "Snapshot restore {phase} failed for table '{table}': {core_error}"
+    )))
 }
 
 #[derive(Debug, Clone)]
@@ -1854,27 +2082,9 @@ fn apply_remote_event_lww_tx(
                             .map_err(StorageError::from)?;
                     }
 
-                    // Side effect for SyncEntity::Snapshot: an `ON CONFLICT
-                    // DO UPDATE` updates `holdings_snapshots.positions` JSON
-                    // in place without firing the FK CASCADE that would
-                    // otherwise wipe `snapshot_positions` rows. Without a
-                    // hook here, the relational table keeps the receiving
-                    // device's *old* positions while the JSON column has
-                    // the synced ones, and `get_snapshot_positions` (which
-                    // prefers the relational table over the JSON fallback)
-                    // returns stale data forever.
-                    //
-                    // Drop the relational rows for the affected snapshot.
-                    // The next read falls back to the just-synced JSON;
-                    // the next local snapshot write rebuilds the relational
-                    // rows via `write_snapshot_positions`. A heavier "parse
-                    // JSON and reinsert here" fix is deferred to Phase B's
-                    // read-path switchover.
                     if applied_entity_change && matches!(entity, SyncEntity::Snapshot) {
-                        diesel::sql_query("DELETE FROM snapshot_positions WHERE snapshot_id = ?")
-                            .bind::<diesel::sql_types::Text, _>(entity_id_value.clone())
-                            .execute(conn)
-                            .map_err(StorageError::from)?;
+                        rebuild_snapshot_positions_from_snapshot_row_tx(conn, &entity_id_value)?;
+                        mark_table_incremental_applied_tx(conn, "snapshot_positions")?;
                     }
                 }
             }
@@ -2951,6 +3161,7 @@ impl AppSyncRepository {
         self.writer
             .exec(move |conn| {
                 let table_set = canonical_sync_table_set(tables)?;
+                let table_set_lookup = table_set.iter().cloned().collect::<HashSet<_>>();
 
                 let now = Utc::now().to_rfc3339();
                 let escaped_path = escape_sqlite_str(&snapshot_db_path);
@@ -2987,6 +3198,8 @@ impl AppSyncRepository {
                     )
                     .execute(conn)
                     .map_err(StorageError::from)?;
+
+                    reset_restore_dependent_read_models(conn, &table_set_lookup)?;
 
                     struct RestorePlan {
                         table: String,
@@ -3055,7 +3268,7 @@ impl AppSyncRepository {
                     for plan in restore_plans.iter().rev() {
                         diesel::sql_query(&plan.clear_sql)
                             .execute(conn)
-                            .map_err(StorageError::from)?;
+                            .map_err(|err| restore_sql_error("clear", &plan.table, err))?;
                         if plan.table == "holdings_snapshots" {
                             delete_orphan_snapshot_rows(conn)?;
                         }
@@ -3064,7 +3277,7 @@ impl AppSyncRepository {
                     for plan in &restore_plans {
                         diesel::sql_query(&plan.copy_sql)
                             .execute(conn)
-                            .map_err(|err| snapshot_restore_error(&plan.table, err.into()))?;
+                            .map_err(|err| restore_sql_error("copy", &plan.table, err))?;
 
                         let state_row = SyncTableStateDB {
                             table_name: plan.table.clone(),
@@ -3206,6 +3419,7 @@ mod tests {
         let filter = snapshot_copy_filter_for_table("taxonomy_categories").expect("filter");
 
         assert!(filter.contains("custom_groups"));
+        assert!(filter.contains("SELECT id FROM taxonomies WHERE is_system = 0"));
         assert!(filter.contains("spending_categories"));
         assert!(filter.contains("income_sources"));
         assert!(filter.contains("savings_categories"));
@@ -7603,16 +7817,20 @@ mod tests {
     }
 
     /// Regression: sync upsert on `holdings_snapshots` updates the JSON
-    /// `positions` column in place, but doesn't touch the relational
-    /// `snapshot_positions` rows. Without the explicit DELETE hook,
-    /// `get_snapshot_positions` would return the receiving device's *old*
-    /// relational rows forever, masking the synced JSON.
+    /// `positions` column in place, but SQLite does not cascade-update the
+    /// sibling `snapshot_positions` rows. Replay must rebuild the relational
+    /// rows so reads do not keep returning the receiving device's old state.
     #[tokio::test]
-    async fn replay_snapshot_clears_stale_snapshot_positions() {
+    async fn replay_snapshot_rebuilds_stale_snapshot_positions() {
         #[derive(diesel::QueryableByName)]
         struct CountRow {
             #[diesel(sql_type = diesel::sql_types::BigInt)]
             c: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct AssetIdRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            asset_id: String,
         }
 
         let (pool, writer) = setup_db();
@@ -7689,8 +7907,8 @@ mod tests {
         assert!(applied, "snapshot update event must apply");
 
         let mut conn = get_connection(&pool).expect("conn");
-        // The relational rows for the snapshot must be wiped — read paths
-        // will fall back to the freshly-synced JSON.
+        // The relational rows for the snapshot must be rebuilt from the
+        // freshly synced JSON, not left pointing at the old local asset.
         let after: CountRow = diesel::sql_query(format!(
             "SELECT COUNT(*) AS c FROM snapshot_positions WHERE snapshot_id = '{}'",
             snap_id
@@ -7698,8 +7916,15 @@ mod tests {
         .get_result(&mut conn)
         .expect("count after");
         assert_eq!(
-            after.c, 0,
-            "stale relational rows must be cleared on sync upsert"
+            after.c, 1,
+            "synced relational rows must be rebuilt on sync upsert"
         );
+        let row: AssetIdRow = diesel::sql_query(format!(
+            "SELECT asset_id FROM snapshot_positions WHERE snapshot_id = '{}'",
+            snap_id
+        ))
+        .get_result(&mut conn)
+        .expect("snapshot position asset");
+        assert_eq!(row.asset_id, "asset-sync-snap-new");
     }
 }
