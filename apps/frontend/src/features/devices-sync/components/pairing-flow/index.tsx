@@ -22,9 +22,12 @@ import { WaitingState } from "./waiting-state";
 import { PairingResult } from "./pairing-result";
 import { EnterCode } from "./enter-code";
 
+export type PairingBootstrapState = "idle" | "active" | "failed";
+
 interface PairingFlowProps {
   onComplete?: () => void;
   onCancel?: () => void;
+  onBootstrapStateChange?: (state: PairingBootstrapState) => void;
   /** Title shown during the initial step (display_code for issuer, enter_code for claimer) */
   title?: string;
   /** Description shown during the initial step */
@@ -47,6 +50,7 @@ function StepHeader({ title, description }: { title?: string; description?: stri
 export function PairingFlow({
   onComplete,
   onCancel,
+  onBootstrapStateChange,
   title,
   description,
   forceRole,
@@ -66,6 +70,7 @@ export function PairingFlow({
       <IssuerFlow
         onComplete={onComplete}
         onCancel={onCancel}
+        onBootstrapStateChange={onBootstrapStateChange}
         title={title}
         description={description}
       />
@@ -75,6 +80,7 @@ export function PairingFlow({
       <ClaimerFlow
         onComplete={onComplete}
         onCancel={onCancel}
+        onBootstrapStateChange={onBootstrapStateChange}
         title={title}
         description={description}
       />
@@ -175,7 +181,13 @@ function IssuerFlow({ onComplete, onCancel, title, description }: PairingFlowPro
 }
 
 // Claimer Flow (untrusted device - enters code and receives keys)
-function ClaimerFlow({ onComplete, onCancel, title, description }: PairingFlowProps) {
+function ClaimerFlow({
+  onComplete,
+  onCancel,
+  onBootstrapStateChange,
+  title,
+  description,
+}: PairingFlowProps) {
   const {
     step,
     error,
@@ -189,6 +201,26 @@ function ClaimerFlow({ onComplete, onCancel, title, description }: PairingFlowPr
   } = usePairingClaimer();
   const [isBackingUp, setIsBackingUp] = useState(false);
   const [backupError, setBackupError] = useState<string | null>(null);
+  const bootstrapStateRef = useRef<PairingBootstrapState>("idle");
+
+  useEffect(() => {
+    let nextState: PairingBootstrapState = "idle";
+    if (step === "syncing" || step === "overwrite_required") {
+      nextState = "active";
+    } else if (step === "error" && bootstrapStateRef.current === "active") {
+      nextState = "failed";
+    }
+
+    if (bootstrapStateRef.current === nextState) return;
+    bootstrapStateRef.current = nextState;
+    onBootstrapStateChange?.(nextState);
+  }, [onBootstrapStateChange, step]);
+
+  useEffect(() => {
+    return () => {
+      onBootstrapStateChange?.("idle");
+    };
+  }, [onBootstrapStateChange]);
 
   const handleCancel = useCallback(async () => {
     await cancel();

@@ -203,7 +203,7 @@ impl ActivityEventsRepositoryTrait for ActivityEventsRepository {
 mod tests {
     use super::*;
     use crate::db::{create_pool, get_connection, init, run_migrations, write_actor::spawn_writer};
-    use crate::schema::{spending_activity_events, sync_outbox};
+    use crate::schema::{activities, spending_activity_events, sync_outbox};
     use diesel::r2d2::{ConnectionManager, Pool};
     use diesel::sqlite::SqliteConnection;
     use std::sync::Arc;
@@ -279,12 +279,20 @@ mod tests {
             .expect("count outbox")
     }
 
+    fn mark_activity_user_modified(conn: &mut SqliteConnection, activity_id: &str) {
+        diesel::update(activities::table.find(activity_id))
+            .set(activities::is_user_modified.eq(1))
+            .execute(conn)
+            .expect("mark activity user modified");
+    }
+
     #[tokio::test]
     async fn broker_activity_event_tag_is_local_only_but_manual_tag_still_syncs() {
         let (pool, writer) = setup_db();
         {
             let mut conn = get_connection(&pool).expect("conn");
             insert_account_and_activity(&mut conn, "broker-activity", "SNAPTRADE");
+            mark_activity_user_modified(&mut conn, "broker-activity");
             insert_account_and_activity(&mut conn, "manual-activity", "MANUAL");
             insert_event(&mut conn);
         }

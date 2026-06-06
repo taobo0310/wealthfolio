@@ -61,12 +61,11 @@ import {
   useRevokeDevice,
   useSyncActions,
   useSyncStatus,
-  type PairingBootstrapState,
 } from "../hooks";
 import { syncService } from "../services/sync-service";
 import { SyncStates, type Device } from "../types";
 import { E2EESetupCard } from "./e2ee-setup-card";
-import { PairingFlow, WaitingState } from "./pairing-flow";
+import { PairingFlow, WaitingState, type PairingBootstrapState } from "./pairing-flow";
 import { RecoveryDialog } from "./recovery-dialog";
 
 const PORTAL_DEVICES_URL = "https://connect.wealthfolio.app/settings/devices";

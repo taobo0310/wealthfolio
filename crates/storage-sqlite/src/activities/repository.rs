@@ -30,8 +30,8 @@ use crate::schema::{
     accounts, activities, assets, import_account_templates, import_runs, import_templates,
 };
 use crate::sync::broker_activity_patch::{
-    broker_activity_identity, broker_activity_user_overlay_changed,
-    broker_activity_user_patch_request,
+    apply_pending_broker_activity_user_patches_tx, broker_activity_identity,
+    broker_activity_user_overlay_changed, broker_activity_user_patch_request,
 };
 use crate::sync::should_sync_outbox_for_activity;
 use crate::utils::chunk_for_sqlite;
@@ -2326,6 +2326,15 @@ impl ActivityRepositoryTrait for ActivityRepository {
                             return Err(StorageError::from(e).into());
                         }
                     }
+                }
+
+                let pending_patch_count =
+                    apply_pending_broker_activity_user_patches_tx(tx.conn())?;
+                if pending_patch_count > 0 {
+                    log::debug!(
+                        "Applied {} pending broker activity user patches after bulk upsert",
+                        pending_patch_count
+                    );
                 }
 
                 if result.skipped > 0 {

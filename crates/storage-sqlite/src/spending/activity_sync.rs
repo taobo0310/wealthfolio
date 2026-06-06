@@ -24,6 +24,14 @@ pub(crate) fn should_sync_activity_local_id_outbox(
 
     Ok(row.is_none_or(
         |(source_system, import_run_id, source_record_id, is_user_modified)| {
+            if is_broker_origin_activity(
+                source_system.as_deref(),
+                import_run_id.as_deref(),
+                source_record_id.as_deref(),
+            ) {
+                return false;
+            }
+
             should_sync_outbox_for_activity(
                 source_system.as_deref(),
                 is_user_modified != 0,
@@ -32,4 +40,22 @@ pub(crate) fn should_sync_activity_local_id_outbox(
             )
         },
     ))
+}
+
+fn is_broker_origin_activity(
+    source_system: Option<&str>,
+    import_run_id: Option<&str>,
+    source_record_id: Option<&str>,
+) -> bool {
+    let normalized_source = source_system
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase());
+
+    if matches!(normalized_source.as_deref(), Some("MANUAL" | "CSV")) {
+        return false;
+    }
+
+    import_run_id.is_some_and(|value| !value.trim().is_empty())
+        || source_record_id.is_some_and(|value| !value.trim().is_empty())
 }

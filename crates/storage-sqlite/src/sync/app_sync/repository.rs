@@ -1,10 +1,8 @@
 //! Repository for app-side device sync tables.
 
 use chrono::{DateTime, Duration, Utc};
-use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::r2d2::{self, Pool};
-use diesel::sql_types::{Bool, Text};
 use diesel::sqlite::SqliteConnection;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
@@ -20,13 +18,12 @@ use wealthfolio_core::sync::{
 use crate::db::{get_connection, WriteHandle};
 use crate::errors::StorageError;
 use crate::schema::{
-    activities, spending_preset_rule_deletions, sync_applied_events, sync_cursor,
-    sync_device_config, sync_engine_state, sync_entity_metadata, sync_outbox, sync_table_state,
+    spending_preset_rule_deletions, sync_applied_events, sync_cursor, sync_device_config,
+    sync_engine_state, sync_entity_metadata, sync_outbox, sync_table_state,
 };
 use crate::spending::deterministic_ids::preset_rule_deletion_id;
 use crate::sync::broker_activity_patch::{
-    broker_activity_identity, broker_activity_user_patch_entity_id,
-    parse_broker_activity_user_patch_payload,
+    apply_broker_activity_user_patch_tx, BrokerActivityUserPatchApplyOutcome,
 };
 
 use super::model::{
@@ -1432,82 +1429,6 @@ fn mark_table_incremental_applied_tx(conn: &mut SqliteConnection, table_name: &s
     Ok(())
 }
 
-fn apply_broker_activity_user_patch_tx(
-    conn: &mut SqliteConnection,
-    entity_id: &str,
-    payload_json: &serde_json::Value,
-    client_timestamp: &str,
-) -> Result<bool> {
-    let payload = parse_broker_activity_user_patch_payload(payload_json)?;
-    let identity = broker_activity_identity(
-        Some(&payload.source_system),
-        Some(&payload.provider_account_id),
-        Some(&payload.source_record_id),
-    )
-    .ok_or_else(|| {
-        Error::Database(DatabaseError::Internal(
-            "Invalid broker activity user patch identity".to_string(),
-        ))
-    })?;
-    let expected_entity_id = broker_activity_user_patch_entity_id(&identity);
-    if expected_entity_id != entity_id {
-        return Err(Error::Database(DatabaseError::Internal(format!(
-            "Broker activity user patch entity_id '{}' does not match payload identity '{}'",
-            entity_id, expected_entity_id
-        ))));
-    }
-
-    let activity_id = activities::table
-        .filter(
-            sql::<Bool>("UPPER(TRIM(COALESCE(activities.source_system, ''))) = ")
-                .bind::<Text, _>(payload.source_system.clone()),
-        )
-        .filter(activities::source_record_id.eq(Some(payload.source_record_id.clone())))
-        .filter(
-            sql::<Bool>(
-                "EXISTS (
-                    SELECT 1 FROM accounts AS current_accounts
-                    WHERE current_accounts.id = activities.account_id
-                      AND TRIM(COALESCE(current_accounts.provider_account_id, '')) = ",
-            )
-            .bind::<Text, _>(payload.provider_account_id.clone())
-            .sql(
-                "
-                ) OR EXISTS (
-                    SELECT 1
-                    FROM import_runs AS broker_import_runs
-                    JOIN accounts AS import_accounts
-                      ON import_accounts.id = broker_import_runs.account_id
-                    WHERE broker_import_runs.id = activities.import_run_id
-                      AND TRIM(COALESCE(import_accounts.provider_account_id, '')) = ",
-            )
-            .bind::<Text, _>(payload.provider_account_id.clone())
-            .sql(")"),
-        )
-        .select(activities::id)
-        .first::<String>(conn)
-        .optional()
-        .map_err(StorageError::from)?;
-
-    let Some(activity_id) = activity_id else {
-        return Ok(true);
-    };
-
-    diesel::update(activities::table.find(activity_id))
-        .set((
-            activities::notes.eq(payload.overlay.notes),
-            activities::activity_type_override.eq(payload.overlay.activity_type_override),
-            activities::subtype.eq(payload.overlay.subtype),
-            activities::needs_review.eq(if payload.overlay.needs_review { 1 } else { 0 }),
-            activities::is_user_modified.eq(1),
-            activities::updated_at.eq(client_timestamp),
-        ))
-        .execute(conn)
-        .map_err(StorageError::from)?;
-
-    Ok(true)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn apply_remote_event_lww_tx(
     conn: &mut SqliteConnection,
@@ -1543,6 +1464,7 @@ fn apply_remote_event_lww_tx(
         None => true,
     };
 
+    let mut record_applied_event = true;
     if should_apply {
         let mut applied_entity_change = true;
         if entity == SyncEntity::CustomTaxonomy {
@@ -1558,13 +1480,23 @@ fn apply_remote_event_lww_tx(
         } else if entity == SyncEntity::BrokerActivityUserPatch {
             match op {
                 SyncOperation::Create | SyncOperation::Update => {
-                    applied_entity_change = apply_broker_activity_user_patch_tx(
+                    match apply_broker_activity_user_patch_tx(
                         conn,
                         &entity_id_value,
+                        &event_id_value,
                         &payload_json,
                         &client_timestamp_value,
-                    )?;
-                    mark_table_incremental_applied_tx(conn, "activities")?;
+                        seq_value,
+                        op,
+                    )? {
+                        BrokerActivityUserPatchApplyOutcome::Applied => {
+                            mark_table_incremental_applied_tx(conn, "activities")?;
+                        }
+                        BrokerActivityUserPatchApplyOutcome::MissingTarget => {
+                            applied_entity_change = false;
+                            record_applied_event = false;
+                        }
+                    }
                 }
                 SyncOperation::Delete => {
                     applied_entity_change = false;
@@ -1709,18 +1641,20 @@ fn apply_remote_event_lww_tx(
         }
     }
 
-    diesel::insert_into(sync_applied_events::table)
-        .values(SyncAppliedEventDB {
-            event_id: event_id_value,
-            seq: seq_value,
-            entity: entity_db,
-            entity_id: entity_id_value,
-            applied_at: Utc::now().to_rfc3339(),
-        })
-        .on_conflict(sync_applied_events::event_id)
-        .do_nothing()
-        .execute(conn)
-        .map_err(StorageError::from)?;
+    if record_applied_event {
+        diesel::insert_into(sync_applied_events::table)
+            .values(SyncAppliedEventDB {
+                event_id: event_id_value,
+                seq: seq_value,
+                entity: entity_db,
+                entity_id: entity_id_value,
+                applied_at: Utc::now().to_rfc3339(),
+            })
+            .on_conflict(sync_applied_events::event_id)
+            .do_nothing()
+            .execute(conn)
+            .map_err(StorageError::from)?;
+    }
 
     Ok(should_apply)
 }
@@ -2927,6 +2861,7 @@ mod tests {
     use std::collections::BTreeSet;
     use tempfile::tempdir;
 
+    use crate::activities::ActivityRepository;
     use crate::db::{create_pool, get_connection, init, run_migrations, write_actor::spawn_writer};
     use crate::goals::GoalRepository;
     use crate::schema::{
@@ -2935,7 +2870,12 @@ mod tests {
         sync_applied_events, sync_device_config, sync_entity_metadata, sync_outbox, taxonomies,
         taxonomy_categories,
     };
+    use crate::sync::broker_activity_patch::{
+        broker_activity_identity, broker_activity_user_patch_entity_id,
+        clear_pending_broker_activity_user_patches,
+    };
     use wealthfolio_core::accounts::account_types;
+    use wealthfolio_core::activities::{ActivityRepositoryTrait, ActivityUpsert};
     use wealthfolio_core::goals::{GoalRepositoryTrait, GoalSummaryUpdate};
 
     fn setup_db() -> (
@@ -3227,6 +3167,148 @@ mod tests {
         assert_eq!(row.7.as_deref(), Some("local-group-id"));
         assert_eq!(row.8.as_deref(), Some("local-import-run"));
         assert_eq!(row.9, "2026-02-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn broker_activity_user_patch_missing_target_defers_until_broker_import() {
+        clear_pending_broker_activity_user_patches();
+        let (pool, writer) = setup_db();
+        let mut conn = get_connection(&pool).expect("conn");
+
+        diesel::sql_query(
+            "INSERT INTO accounts \
+             (id, name, account_type, `group`, currency, is_default, is_active, created_at, updated_at, \
+              platform_id, account_number, meta, provider, provider_account_id, is_archived, tracking_mode) \
+             VALUES ('broker-local-account', 'Broker Account', 'cash', NULL, 'USD', 0, 1, \
+                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL, NULL, NULL, 'SNAPTRADE', \
+                     'provider-account-1', 0, 'portfolio')",
+        )
+        .execute(&mut conn)
+        .expect("insert broker account");
+
+        let identity = broker_activity_identity(
+            Some("SNAPTRADE"),
+            Some("provider-account-1"),
+            Some("broker-record-missing-first"),
+        )
+        .expect("broker identity");
+        let entity_id = broker_activity_user_patch_entity_id(&identity);
+        let entity_db = enum_to_db(&SyncEntity::BrokerActivityUserPatch).expect("entity db");
+
+        let applied = apply_remote_event_lww_tx(
+            &mut conn,
+            SyncEntity::BrokerActivityUserPatch,
+            entity_id.clone(),
+            SyncOperation::Update,
+            "broker-patch-event-missing-first".to_string(),
+            "2026-02-01T00:00:00Z".to_string(),
+            9,
+            serde_json::json!({
+                "sourceSystem": "SNAPTRADE",
+                "providerAccountId": "provider-account-1",
+                "sourceRecordId": "broker-record-missing-first",
+                "overlay": {
+                    "notes": "Synced pending note",
+                    "activityTypeOverride": "SELL",
+                    "subtype": "DRIP",
+                    "needsReview": false
+                }
+            }),
+        )
+        .expect("defer missing broker activity patch");
+
+        assert!(!applied);
+        let metadata_count: i64 = sync_entity_metadata::table
+            .filter(sync_entity_metadata::entity.eq(&entity_db))
+            .filter(sync_entity_metadata::entity_id.eq(&entity_id))
+            .count()
+            .get_result(&mut conn)
+            .expect("metadata count");
+        assert_eq!(metadata_count, 0);
+        let applied_event_count: i64 = sync_applied_events::table
+            .filter(sync_applied_events::event_id.eq("broker-patch-event-missing-first"))
+            .count()
+            .get_result(&mut conn)
+            .expect("applied event count");
+        assert_eq!(applied_event_count, 0);
+        drop(conn);
+
+        let activity_repo = ActivityRepository::new(pool.clone(), writer);
+        activity_repo
+            .bulk_upsert(vec![ActivityUpsert {
+                id: "broker-local-activity-imported-later".to_string(),
+                account_id: "broker-local-account".to_string(),
+                asset_id: None,
+                activity_type: "BUY".to_string(),
+                subtype: None,
+                activity_date: "2026-01-01T00:00:00Z".to_string(),
+                quantity: Some(Decimal::new(10, 0)),
+                unit_price: Some(Decimal::new(5, 0)),
+                currency: "USD".to_string(),
+                fee: Some(Decimal::new(1, 0)),
+                amount: Some(Decimal::new(50, 0)),
+                status: None,
+                notes: Some("Broker note".to_string()),
+                fx_rate: None,
+                metadata: Some("{\"broker\":\"keep\"}".to_string()),
+                needs_review: Some(true),
+                source_system: Some("SNAPTRADE".to_string()),
+                source_record_id: Some("broker-record-missing-first".to_string()),
+                source_group_id: Some("broker-group".to_string()),
+                idempotency_key: Some("broker-idempotency-missing-first".to_string()),
+                import_run_id: None,
+            }])
+            .await
+            .expect("import broker activity");
+
+        let mut conn = get_connection(&pool).expect("conn");
+        let row = activities::table
+            .find("broker-local-activity-imported-later")
+            .select((
+                activities::activity_type,
+                activities::activity_type_override,
+                activities::subtype,
+                activities::notes,
+                activities::needs_review,
+                activities::is_user_modified,
+                activities::amount,
+                activities::source_group_id,
+            ))
+            .first::<(
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i32,
+                i32,
+                Option<String>,
+                Option<String>,
+            )>(&mut conn)
+            .expect("imported broker activity");
+
+        assert_eq!(row.0, "BUY");
+        assert_eq!(row.1.as_deref(), Some("SELL"));
+        assert_eq!(row.2.as_deref(), Some("DRIP"));
+        assert_eq!(row.3.as_deref(), Some("Synced pending note"));
+        assert_eq!(row.4, 0);
+        assert_eq!(row.5, 1);
+        assert_eq!(row.6.as_deref(), Some("50"));
+        assert_eq!(row.7.as_deref(), Some("broker-group"));
+
+        let metadata_count: i64 = sync_entity_metadata::table
+            .filter(sync_entity_metadata::entity.eq(&entity_db))
+            .filter(sync_entity_metadata::entity_id.eq(&entity_id))
+            .count()
+            .get_result(&mut conn)
+            .expect("metadata count after replay");
+        assert_eq!(metadata_count, 1);
+        let applied_event_count: i64 = sync_applied_events::table
+            .filter(sync_applied_events::event_id.eq("broker-patch-event-missing-first"))
+            .count()
+            .get_result(&mut conn)
+            .expect("applied event count after replay");
+        assert_eq!(applied_event_count, 1);
+        clear_pending_broker_activity_user_patches();
     }
 
     fn insert_goal_for_test(conn: &mut SqliteConnection, goal_id: &str) -> Result<()> {
