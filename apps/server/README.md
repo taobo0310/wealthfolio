@@ -6,14 +6,14 @@ Overview
 
 Run locally (Rust only)
 - From the repo root:
-  - `cargo run --manifest-path src-server/Cargo.toml`
+  - `cargo run --manifest-path apps/server/Cargo.toml`
 
 Docker image
 - Pull the latest published server image with `docker pull wealthfolio/wealthfolio:latest`.
 - Use that tag (or your locally built image) in the Docker run examples inside the root `README.md`.
 
 Key environment variables
-- `WF_LISTEN_ADDR`: Bind address, default `127.0.0.1:8080`.
+- `WF_LISTEN_ADDR`: Bind address, default `0.0.0.0:8088`.
 - `WF_DB_PATH`: Path to the SQLite database file (or a directory; if a directory is provided, `app.db` is used inside it). Example: `./db/app.db`.
 - `WF_CORS_ALLOW_ORIGINS`: Comma-separated list of allowed origins for CORS. Example: `http://localhost:1420`.
 - `WF_REQUEST_TIMEOUT_MS`: Request timeout in milliseconds. Default `30000`.
