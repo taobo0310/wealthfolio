@@ -486,8 +486,18 @@ export default function SpendingTabContent() {
   const { data: budget, isError: budgetErrored } = useBudget();
   const todayParts = useMemo(() => getZonedDateParts(new Date(), appTimezone), [appTimezone]);
   const currentBudgetMonthKey = useMemo(() => monthKeyFromParts(todayParts), [todayParts]);
-  const [budgetMonthKey, setBudgetMonthKey] = useState(() => monthKeyFromParts(todayParts));
-  const [budgetMonthTouched, setBudgetMonthTouched] = useState(false);
+  const [budgetMonthKey, setBudgetMonthKey] = useState(() => {
+    const current = monthKeyFromParts(todayParts);
+    if (selection.kind === "period" && selection.code === "LAST_MONTH")
+      return addMonthsToMonthKey(current, -1);
+    if (selection.kind === "month" && selection.monthKey <= current) return selection.monthKey;
+    return current;
+  });
+  const [budgetMonthTouched, setBudgetMonthTouched] = useState(
+    () =>
+      (selection.kind === "period" && selection.code === "LAST_MONTH") ||
+      selection.kind === "month",
+  );
   useEffect(() => {
     setBudgetMonthKey((monthKey) => {
       if (!budgetMonthTouched) return currentBudgetMonthKey;
